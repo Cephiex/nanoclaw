@@ -165,6 +165,8 @@ function escapeHtml(t) {
 function renderText(t) {
   return t
     .replace(/\`\`\`([\s\S]*?)\`\`\`/g, (_,c) => '<pre>' + escapeHtml(c.trim()) + '</pre>')
+    .replace(/!\\[([^\\]]*?)\\]\\(([^)]+?)\\)/g, (_,alt,src) => '<img src="' + escapeHtml(src) + '" alt="' + escapeHtml(alt) + '" style="max-width:100%;max-height:400px;border-radius:8px;display:block;margin-top:6px;" loading="lazy">')
+    .replace(/\\[([^\\]]+?)\\]\\(([^)]+?)\\)/g, (_,text,href) => '<a href="' + escapeHtml(href) + '" target="_blank" rel="noopener">' + escapeHtml(text) + '</a>')
     .replace(/\\*\\*(.+?)\\*\\*/g, '<strong>$1</strong>')
     .replace(/\\*(.+?)\\*/g, '<em>$1</em>')
     .replace(/_(.*?)_/g, '<em>$1</em>')
@@ -333,6 +335,26 @@ export class WebChatChannel implements Channel {
       if (req.url === '/' || req.url === '/index.html') {
         res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
         res.end(html);
+      } else if (req.url?.startsWith('/uploads/')) {
+        // Serve generated/uploaded files from the group uploads folder
+        const filename = path.basename(req.url.slice('/uploads/'.length));
+        const filePath = path.join(this.getUploadDir(), filename);
+        fs.readFile(filePath, (err, data) => {
+          if (err) {
+            res.writeHead(404);
+            res.end('Not found');
+            return;
+          }
+          const ext = path.extname(filename).toLowerCase();
+          const mimeTypes: Record<string, string> = {
+            '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
+            '.gif': 'image/gif', '.webp': 'image/webp', '.svg': 'image/svg+xml',
+            '.pdf': 'application/pdf', '.txt': 'text/plain',
+          };
+          const contentType = mimeTypes[ext] || 'application/octet-stream';
+          res.writeHead(200, { 'Content-Type': contentType });
+          res.end(data);
+        });
       } else {
         res.writeHead(404);
         res.end('Not found');

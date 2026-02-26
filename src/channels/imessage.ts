@@ -5,7 +5,7 @@ import path from 'path';
 
 import Database from 'better-sqlite3';
 
-import { ASSISTANT_NAME } from '../config.js';
+import { ASSISTANT_NAME, GROUPS_DIR, MAIN_GROUP_FOLDER } from '../config.js';
 import { logger } from '../logger.js';
 import {
   Channel,
@@ -40,6 +40,49 @@ function appleScriptLiteral(text: string): string {
     .split('\n');
   // Join multi-line text using AppleScript string concatenation
   return lines.map((l) => `"${l}"`).join(' & return & ');
+}
+
+/**
+ * Resolve a container or web-chat path to an absolute host path.
+ * - /uploads/filename          → groups/main/uploads/filename
+ * - /workspace/group/uploads/filename → groups/main/uploads/filename
+ * Returns null if the pattern doesn't match.
+ */
+function resolveUploadPath(ref: string): string | null {
+  const webMatch = ref.match(/^\/uploads\/([^/]+)$/);
+  if (webMatch)
+    return path.join(GROUPS_DIR, MAIN_GROUP_FOLDER, 'uploads', webMatch[1]);
+
+  const containerMatch = ref.match(/^\/workspace\/group\/uploads\/([^/]+)$/);
+  if (containerMatch)
+    return path.join(GROUPS_DIR, MAIN_GROUP_FOLDER, 'uploads', containerMatch[1]);
+
+  return null;
+}
+
+/** Return host paths for every image/file ref embedded in the text. */
+function extractAttachments(text: string): string[] {
+  const paths: string[] = [];
+  // Markdown images: ![alt](/uploads/file) or ![alt](/workspace/group/uploads/file)
+  for (const m of text.matchAll(/!\[[^\]]*\]\(([^)]+)\)/g)) {
+    const resolved = resolveUploadPath(m[1]);
+    if (resolved && fs.existsSync(resolved)) paths.push(resolved);
+  }
+  // Inline file refs: [Attached file: /workspace/group/uploads/file]
+  for (const m of text.matchAll(/\[Attached file: ([^\]]+)\]/g)) {
+    const resolved = resolveUploadPath(m[1]);
+    if (resolved && fs.existsSync(resolved)) paths.push(resolved);
+  }
+  return paths;
+}
+
+/** Strip image/file reference syntax, leaving only plain text. */
+function stripAttachmentRefs(text: string): string {
+  return text
+    .replace(/!\[[^\]]*\]\([^)]+\)/g, '')
+    .replace(/\[Attached file: [^\]]+\]/g, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 export function chatGuidToJid(guid: string): string {
@@ -185,24 +228,58 @@ export class IMessageChannel implements Channel {
 
   async sendMessage(jid: string, text: string): Promise<void> {
     const chatGuid = jidToChatGuid(jid);
-    const prefixed = `${ASSISTANT_NAME}: ${text}`;
-    const literal = appleScriptLiteral(prefixed);
+    // Strip assistant prefix if present (added by router) before parsing
+    const body = text.startsWith(`${ASSISTANT_NAME}: `)
+      ? text.slice(ASSISTANT_NAME.length + 2)
+      : text;
 
+    const attachments = extractAttachments(body);
+    const textOnly = stripAttachmentRefs(body);
+
+    if (textOnly) {
+      await this.sendText(chatGuid, `${ASSISTANT_NAME}: ${textOnly}`);
+    }
+    for (const filePath of attachments) {
+      await this.sendFileAttachment(chatGuid, filePath);
+    }
+  }
+
+  private async sendText(chatGuid: string, text: string): Promise<void> {
+    const literal = appleScriptLiteral(text);
     const script = `tell application "Messages"
   send ${literal} to chat id "${chatGuid}"
 end tell`;
-
     const tmpScript = path.join(os.tmpdir(), `nanoclaw_send_${Date.now()}.scpt`);
     fs.writeFileSync(tmpScript, script, 'utf-8');
-
     return new Promise((resolve, reject) => {
       exec(`osascript ${JSON.stringify(tmpScript)}`, (err) => {
         fs.rmSync(tmpScript, { force: true });
         if (err) {
-          logger.error({ err, jid }, 'Failed to send iMessage');
+          logger.error({ err, chatGuid }, 'Failed to send iMessage text');
           reject(err);
         } else {
-          logger.info({ jid, length: prefixed.length }, 'iMessage sent');
+          logger.info({ chatGuid, length: text.length }, 'iMessage sent');
+          resolve();
+        }
+      });
+    });
+  }
+
+  private async sendFileAttachment(chatGuid: string, filePath: string): Promise<void> {
+    const safePath = filePath.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    const script = `tell application "Messages"
+  send POSIX file "${safePath}" to chat id "${chatGuid}"
+end tell`;
+    const tmpScript = path.join(os.tmpdir(), `nanoclaw_send_${Date.now()}.scpt`);
+    fs.writeFileSync(tmpScript, script, 'utf-8');
+    return new Promise((resolve, reject) => {
+      exec(`osascript ${JSON.stringify(tmpScript)}`, (err) => {
+        fs.rmSync(tmpScript, { force: true });
+        if (err) {
+          logger.error({ err, filePath }, 'Failed to send iMessage attachment');
+          reject(err);
+        } else {
+          logger.info({ filePath }, 'iMessage attachment sent');
           resolve();
         }
       });

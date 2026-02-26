@@ -1,0 +1,192 @@
+#!/usr/bin/env node
+'use strict';
+/**
+ * gcal - Google Calendar CLI for NanoClaw agents
+ *
+ * Usage:
+ *   gcal list [days]                        List upcoming events (default: 7 days)
+ *   gcal search <query> [days]              Search events (default: 30 days)
+ *   gcal calendars                          List available calendars
+ *   gcal get <eventId>                      Get full event details
+ *   gcal create '<json>'                    Create event from JSON body
+ *   gcal update <eventId> '<json>'          Patch event with JSON fields
+ *   gcal delete <eventId>                   Delete event
+ *
+ * Required env vars:
+ *   GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REFRESH_TOKEN
+ *
+ * Optional:
+ *   GOOGLE_CALENDAR_ID   (default: "primary")
+ */
+
+const https = require('https');
+const querystring = require('querystring');
+
+const CLIENT_ID     = process.env.GOOGLE_CLIENT_ID     || '';
+const CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET || '';
+const REFRESH_TOKEN = process.env.GOOGLE_REFRESH_TOKEN || '';
+const CALENDAR_ID   = process.env.GOOGLE_CALENDAR_ID   || 'primary';
+
+if (!CLIENT_ID || !CLIENT_SECRET || !REFRESH_TOKEN) {
+  console.error('gcal: GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, and GOOGLE_REFRESH_TOKEN must be set.');
+  process.exit(1);
+}
+
+function httpsRequest(url, opts = {}) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const options = {
+      hostname: parsed.hostname,
+      path: parsed.pathname + parsed.search,
+      method: opts.method || 'GET',
+      headers: opts.headers || {},
+    };
+    const req = https.request(options, (res) => {
+      let data = '';
+      res.on('data', (chunk) => { data += chunk; });
+      res.on('end', () => {
+        if (res.statusCode === 204) { resolve(null); return; }
+        try {
+          const parsed = JSON.parse(data);
+          if (res.statusCode >= 400) {
+            const msg = parsed.error?.message || JSON.stringify(parsed);
+            reject(new Error(`HTTP ${res.statusCode}: ${msg}`));
+          } else {
+            resolve(parsed);
+          }
+        } catch {
+          reject(new Error(`Non-JSON response (${res.statusCode}): ${data.slice(0, 200)}`));
+        }
+      });
+    });
+    req.on('error', reject);
+    if (opts.body) req.write(opts.body);
+    req.end();
+  });
+}
+
+async function getAccessToken() {
+  const body = querystring.stringify({
+    client_id: CLIENT_ID,
+    client_secret: CLIENT_SECRET,
+    refresh_token: REFRESH_TOKEN,
+    grant_type: 'refresh_token',
+  });
+  const result = await httpsRequest('https://oauth2.googleapis.com/token', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/x-www-form-urlencoded',
+      'Content-Length': Buffer.byteLength(body),
+    },
+    body,
+  });
+  if (!result.access_token) throw new Error('Failed to get access token: ' + JSON.stringify(result));
+  return result.access_token;
+}
+
+async function calApi(path, method = 'GET', body = null, token) {
+  const bodyStr = body ? JSON.stringify(body) : null;
+  const headers = { Authorization: `Bearer ${token}` };
+  if (bodyStr) {
+    headers['Content-Type'] = 'application/json';
+    headers['Content-Length'] = Buffer.byteLength(bodyStr);
+  }
+  return httpsRequest(`https://www.googleapis.com/calendar/v3${path}`, {
+    method, headers, body: bodyStr,
+  });
+}
+
+function fmtEvent(e) {
+  const start = e.start?.dateTime || e.start?.date || '?';
+  const end   = e.end?.dateTime   || e.end?.date   || '?';
+  const loc   = e.location ? `\n  Location : ${e.location}` : '';
+  const desc  = e.description ? `\n  Desc     : ${e.description.slice(0, 300)}` : '';
+  const link  = e.htmlLink ? `\n  Link     : ${e.htmlLink}` : '';
+  return `${start} → ${end}\n  Title    : ${e.summary || '(no title)'}${loc}${desc}${link}\n  ID       : ${e.id}`;
+}
+
+async function main() {
+  const [,, cmd = 'list', ...args] = process.argv;
+  const token = await getAccessToken();
+  const calId = encodeURIComponent(CALENDAR_ID);
+
+  switch (cmd) {
+    case 'calendars': {
+      const data = await calApi('/users/me/calendarList', 'GET', null, token);
+      for (const c of data.items || []) {
+        console.log(`${c.id}  |  ${c.summary}${c.primary ? '  (primary)' : ''}`);
+      }
+      break;
+    }
+
+    case 'list': {
+      const days = Math.max(1, parseInt(args[0] || '7', 10));
+      const now  = new Date();
+      const tmax = new Date(now.getTime() + days * 86400000);
+      const params = new URLSearchParams({
+        orderBy: 'startTime', singleEvents: 'true',
+        timeMin: now.toISOString(), timeMax: tmax.toISOString(),
+        maxResults: '50',
+      });
+      const data = await calApi(`/calendars/${calId}/events?${params}`, 'GET', null, token);
+      const events = data.items || [];
+      if (!events.length) { console.log('No upcoming events.'); break; }
+      events.forEach(e => console.log(fmtEvent(e) + '\n'));
+      break;
+    }
+
+    case 'search': {
+      if (!args[0]) { console.error('Usage: gcal search <query> [days]'); process.exit(1); }
+      const days = Math.max(1, parseInt(args[1] || '30', 10));
+      const now  = new Date();
+      const tmax = new Date(now.getTime() + days * 86400000);
+      const params = new URLSearchParams({
+        q: args[0], singleEvents: 'true',
+        timeMin: now.toISOString(), timeMax: tmax.toISOString(),
+        maxResults: '20',
+      });
+      const data = await calApi(`/calendars/${calId}/events?${params}`, 'GET', null, token);
+      const events = data.items || [];
+      if (!events.length) { console.log('No events found.'); break; }
+      events.forEach(e => console.log(fmtEvent(e) + '\n'));
+      break;
+    }
+
+    case 'get': {
+      if (!args[0]) { console.error('Usage: gcal get <eventId>'); process.exit(1); }
+      const e = await calApi(`/calendars/${calId}/events/${args[0]}`, 'GET', null, token);
+      console.log(JSON.stringify(e, null, 2));
+      break;
+    }
+
+    case 'create': {
+      if (!args[0]) { console.error('Usage: gcal create \'{"summary":"...","start":{"dateTime":"..."},"end":{"dateTime":"..."}}\''); process.exit(1); }
+      const body = JSON.parse(args[0]);
+      const e = await calApi(`/calendars/${calId}/events`, 'POST', body, token);
+      console.log('Created:\n' + fmtEvent(e));
+      break;
+    }
+
+    case 'update': {
+      if (!args[0] || !args[1]) { console.error('Usage: gcal update <eventId> \'{"summary":"..."}\' '); process.exit(1); }
+      const body = JSON.parse(args[1]);
+      const e = await calApi(`/calendars/${calId}/events/${args[0]}`, 'PATCH', body, token);
+      console.log('Updated:\n' + fmtEvent(e));
+      break;
+    }
+
+    case 'delete': {
+      if (!args[0]) { console.error('Usage: gcal delete <eventId>'); process.exit(1); }
+      await calApi(`/calendars/${calId}/events/${args[0]}`, 'DELETE', null, token);
+      console.log('Deleted event ' + args[0]);
+      break;
+    }
+
+    default:
+      console.error(`Unknown command: ${cmd}`);
+      console.error('Commands: list, calendars, search, get, create, update, delete');
+      process.exit(1);
+  }
+}
+
+main().catch(e => { console.error('gcal error:', e.message); process.exit(1); });

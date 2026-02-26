@@ -47,6 +47,10 @@ COPY agent-runner/ ./
 # Build TypeScript
 RUN npm run build
 
+# Install helper scripts (gcal, etc.)
+COPY scripts/ /usr/local/bin/
+RUN chmod +x /usr/local/bin/*
+
 # Create workspace directories
 RUN mkdir -p /workspace/group /workspace/global /workspace/extra /workspace/ipc/messages /workspace/ipc/tasks /workspace/ipc/input
 
