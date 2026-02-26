@@ -8,7 +8,8 @@ import {
   POLL_INTERVAL,
   TRIGGER_PATTERN,
 } from './config.js';
-import { WhatsAppChannel } from './channels/whatsapp.js';
+import { IMessageChannel } from './channels/imessage.js';
+import { WebChatChannel, WEBCHAT_JID } from './channels/webchat.js';
 import {
   ContainerOutput,
   runContainerAgent,
@@ -51,7 +52,8 @@ let registeredGroups: Record<string, RegisteredGroup> = {};
 let lastAgentTimestamp: Record<string, string> = {};
 let messageLoopRunning = false;
 
-let whatsapp: WhatsAppChannel;
+let imessage: IMessageChannel;
+let webchat: WebChatChannel;
 const channels: Channel[] = [];
 const queue = new GroupQueue();
 
@@ -475,9 +477,37 @@ async function main(): Promise<void> {
   };
 
   // Create and connect channels
-  whatsapp = new WhatsAppChannel(channelOpts);
-  channels.push(whatsapp);
-  await whatsapp.connect();
+  imessage = new IMessageChannel({
+    ...channelOpts,
+    autoRegister: (jid: string) => {
+      // Route any new iMessage conversation to the main group folder
+      const mainGroup = Object.values(registeredGroups).find(
+        (g) => g.folder === MAIN_GROUP_FOLDER,
+      );
+      if (!mainGroup) return;
+      registerGroup(jid, {
+        name: mainGroup.name,
+        folder: mainGroup.folder,
+        trigger: mainGroup.trigger,
+        added_at: new Date().toISOString(),
+        requiresTrigger: false,
+      });
+    },
+  });
+  channels.push(imessage);
+  await imessage.connect();
+
+  // Web chat channel
+  webchat = new WebChatChannel(channelOpts);
+  channels.push(webchat);
+  await webchat.connect();
+  registerGroup(WEBCHAT_JID, {
+    name: 'web',
+    folder: 'main',
+    trigger: `@${ASSISTANT_NAME}`,
+    added_at: new Date().toISOString(),
+    requiresTrigger: false,
+  });
 
   // Start subsystems (independently of connection handler)
   startSchedulerLoop({
@@ -504,8 +534,7 @@ async function main(): Promise<void> {
     },
     registeredGroups: () => registeredGroups,
     registerGroup,
-    syncGroupMetadata: (force) =>
-      whatsapp?.syncGroupMetadata(force) ?? Promise.resolve(),
+    syncGroupMetadata: (_force) => Promise.resolve(),
     getAvailableGroups,
     writeGroupsSnapshot: (gf, im, ag, rj) =>
       writeGroupsSnapshot(gf, im, ag, rj),

@@ -90,7 +90,7 @@ async function syncGroups(projectRoot: string): Promise<void> {
   let syncOk = false;
   try {
     const syncScript = `
-import makeWASocket, { useMultiFileAuthState, makeCacheableSignalKeyStore, Browsers } from '@whiskeysockets/baileys';
+import makeWASocket, { useMultiFileAuthState, makeCacheableSignalKeyStore, Browsers, fetchLatestBaileysVersion } from '@whiskeysockets/baileys';
 import pino from 'pino';
 import path from 'path';
 import fs from 'fs';
@@ -113,60 +113,83 @@ const upsert = db.prepare(
   'INSERT INTO chats (jid, name, last_message_time) VALUES (?, ?, ?) ON CONFLICT(jid) DO UPDATE SET name = excluded.name'
 );
 
-const { state, saveCreds } = await useMultiFileAuthState(authDir);
+let retries = 0;
+const MAX_RETRIES = 3;
+let done = false;
 
-const sock = makeWASocket({
-  auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
-  printQRInTerminal: false,
-  logger,
-  browser: Browsers.macOS('Chrome'),
-});
+async function connect() {
+  const { state, saveCreds } = await useMultiFileAuthState(authDir);
+  const { version } = await fetchLatestBaileysVersion().catch(() => ({ version: undefined }));
+
+  const sock = makeWASocket({
+    version,
+    auth: { creds: state.creds, keys: makeCacheableSignalKeyStore(state.keys, logger) },
+    printQRInTerminal: false,
+    logger,
+    browser: Browsers.macOS('Chrome'),
+  });
+
+  sock.ev.on('creds.update', saveCreds);
+
+  sock.ev.on('connection.update', async (update) => {
+    if (update.connection === 'open') {
+      try {
+        const groups = await sock.groupFetchAllParticipating();
+        const now = new Date().toISOString();
+        let count = 0;
+        for (const [jid, metadata] of Object.entries(groups)) {
+          if (metadata.subject) {
+            upsert.run(jid, metadata.subject, now);
+            count++;
+          }
+        }
+        console.log('SYNCED:' + count);
+        done = true;
+      } catch (err) {
+        console.error('FETCH_ERROR:' + err.message);
+      } finally {
+        clearTimeout(timeout);
+        sock.end(undefined);
+        db.close();
+        process.exit(0);
+      }
+    } else if (update.connection === 'close') {
+      if (done) return; // normal close after successful sync
+      const statusCode = update.lastDisconnect?.error?.output?.statusCode;
+      // 515 = restart required, 428 = connection replaced — both are retriable
+      if ((statusCode === 515 || statusCode === 428) && retries < MAX_RETRIES) {
+        retries++;
+        setTimeout(() => connect(), 2000);
+        return;
+      }
+      clearTimeout(timeout);
+      console.error('CONNECTION_CLOSED:' + (statusCode ?? 'unknown'));
+      process.exit(1);
+    }
+  });
+}
 
 const timeout = setTimeout(() => {
   console.error('TIMEOUT');
   process.exit(1);
-}, 30000);
+}, 40000);
 
-sock.ev.on('creds.update', saveCreds);
-
-sock.ev.on('connection.update', async (update) => {
-  if (update.connection === 'open') {
-    try {
-      const groups = await sock.groupFetchAllParticipating();
-      const now = new Date().toISOString();
-      let count = 0;
-      for (const [jid, metadata] of Object.entries(groups)) {
-        if (metadata.subject) {
-          upsert.run(jid, metadata.subject, now);
-          count++;
-        }
-      }
-      console.log('SYNCED:' + count);
-    } catch (err) {
-      console.error('FETCH_ERROR:' + err.message);
-    } finally {
-      clearTimeout(timeout);
-      sock.end(undefined);
-      db.close();
-      process.exit(0);
-    }
-  } else if (update.connection === 'close') {
-    clearTimeout(timeout);
-    console.error('CONNECTION_CLOSED');
-    process.exit(1);
-  }
-});
+connect();
 `;
 
-    const output = execSync(
-      `node --input-type=module -e ${JSON.stringify(syncScript)}`,
-      {
+    const tmpFile = path.join(projectRoot, 'logs', '_sync_groups_tmp.mjs');
+    fs.writeFileSync(tmpFile, syncScript, 'utf-8');
+    let output: string;
+    try {
+      output = execSync(`node ${JSON.stringify(tmpFile)}`, {
         cwd: projectRoot,
         encoding: 'utf-8',
         timeout: 45000,
         stdio: ['ignore', 'pipe', 'pipe'],
-      },
-    );
+      });
+    } finally {
+      fs.rmSync(tmpFile, { force: true });
+    }
     syncOk = output.includes('SYNCED:');
     logger.info({ output: output.trim() }, 'Sync output');
   } catch (err) {
