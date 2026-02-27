@@ -188,7 +188,7 @@ function createPreCompactHook(assistantName?: string): HookCallback {
 // Secrets to strip from Bash tool subprocess environments.
 // These are needed by claude-code for API auth but should never
 // be visible to commands Kit runs.
-const SECRET_ENV_VARS = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN'];
+const SECRET_ENV_VARS = ['ANTHROPIC_API_KEY', 'CLAUDE_CODE_OAUTH_TOKEN', 'SUPABASE_ACCESS_TOKEN'];
 
 function createSanitizeBashHook(): HookCallback {
   return async (input, _toolUseId, _context) => {
@@ -434,7 +434,8 @@ async function runQuery(
         'NotebookEdit',
         'mcp__nanoclaw__*',
         'mcp__parallel-search__*',
-        'mcp__parallel-task__*'
+        'mcp__parallel-task__*',
+        'mcp__supabase__*'
       ],
       env: sdkEnv,
       permissionMode: 'bypassPermissions',
@@ -467,6 +468,16 @@ async function runQuery(
           log('Parallel AI MCP servers configured');
         } else {
           log('PARALLEL_API_KEY not set, skipping Parallel AI integration');
+        }
+        const supabaseAccessToken = process.env.SUPABASE_ACCESS_TOKEN;
+        if (supabaseAccessToken) {
+          servers['supabase'] = {
+            command: 'npx',
+            args: ['-y', '@supabase/mcp-server-supabase@latest', '--access-token', supabaseAccessToken, '--project-ref', 'zcltjrrpisragsshqgpq'],
+          };
+          log('Supabase MCP server configured');
+        } else {
+          log('SUPABASE_ACCESS_TOKEN not set, skipping Supabase integration');
         }
         return servers;
       })(),
